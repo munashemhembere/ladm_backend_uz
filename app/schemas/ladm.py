@@ -260,7 +260,9 @@ class RRRSummary(BaseModel):
 class FullSpatialUnitRecord(BaseModel):
     """
     Complete LADM record for any spatial unit.
-    Used by the GeoBIM frontend button-click workflow.
+    Primary endpoint for GeoBIM frontend button-click workflow.
+    Frontend assigns su_id to each button/panel → calls this endpoint
+    → receives full governance record → displays in info panel.
     """
     su_id: str
     label: Optional[str]
@@ -268,13 +270,13 @@ class FullSpatialUnitRecord(BaseModel):
     area_m2: Optional[float]
     capacity: Optional[int]
     surface_relation: Optional[str]
+    dimension: Optional[str]          # 2D | 3D
     global_id_ifc: Optional[str]
-    dimension: Optional[str]             # <-- ADDED: Passes boundary structural metadata to frontend clicks
     baunit_name: Optional[str]
     baunit_type: Optional[str]
     rrrs: List[RRRSummary]
     ifc_mappings: List[IFCMappingOut]
-    geometry_wgs84: Optional[Dict[str, Any]]  # reprojected to EPSG:4326
+    geometry_wgs84: Optional[Dict[str, Any]]  # EPSG:4326 for GeoBIM frontend
 
 
 # ── Provenance ────────────────────────────────────────────────

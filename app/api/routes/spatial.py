@@ -238,85 +238,84 @@ async def all_spatial_units_geojson(
 
 @router.get("/spatial-units/{su_id}/full-record",
             response_model=FullSpatialUnitRecord,
-            summary="Full LADM record for any spatial unit — used by GeoBIM frontend button click")
+            summary="Full LADM record — geometry + RRRs + parties + IFC (GeoBIM button endpoint)")
 async def spatial_unit_full_record(
-    su_id: str, db: AsyncSession = Depends(get_db), _=Depends(require_auth)
+    su_id: str,
+    db: AsyncSession = Depends(get_db),
+    _=Depends(require_auth)
 ):
     """
-    Returns the complete governance record for a spatial unit:
-    - Attributes (label, su_type, area_m2, capacity, surface_relation)
+    Full LADM record for any spatial unit — used by GeoBIM frontend button click.
+
+    Returns the complete governance record:
+    - Attributes (label, su_type, area_m2, capacity, surface_relation, dimension)
     - BAUnit name and type
     - All associated RRRs with party name and role
     - All IFC GlobalId mappings
     - Geometry reprojected to EPSG:4326 (WGS84) as GeoJSON
 
-    **This is the primary endpoint called by the GeoBIM frontend
-    when a user clicks a button/panel linked to a campus space.**
-
     Integration pattern:
-      frontend button (room/building/parcel) → sends su_id to this endpoint
-      → receives full LADM governance record → displays in info panel
+      frontend button (room/building/parcel)
+      → sends su_id to this endpoint
+      → receives full LADM governance record
+      → displays in info panel
     """
-    # Load spatial unit with baunit
+    # Load spatial unit with baunit and ifc mappings
     result = await db.execute(
         select(LaSpatialUnit)
-        .options(selectinload(LaSpatialUnit.baunit))
-        .options(selectinload(LaSpatialUnit.ifc_mappings))
+        .options(
+            selectinload(LaSpatialUnit.baunit),
+            selectinload(LaSpatialUnit.ifc_mappings),
+        )
         .where(LaSpatialUnit.su_id == su_id)
     )
     su = result.scalar_one_or_none()
-    if not su: raise HTTPException(404, f"Spatial unit '{su_id}' not found")
+    if not su:
+        raise HTTPException(404, f"Spatial unit '{su_id}' not found")
 
-    # Get all RRRs for this unit's baunit (direct + via rrr_baunit table)
-    rrr_ids_result = await db.execute(
-        select(LaRRRBaunit.rrr_id).where(LaRRRBaunit.baunit_id == su.baunit_id)
-    )
-    rrr_ids = [r[0] for r in rrr_ids_result.all()]
-
-    rrrs_result = await db.execute(
-        select(LaRRR)
-        .options(selectinload(LaRRR.party))
-        .where(
-            (LaRRR.baunit_id == su.baunit_id) if su.baunit_id else LaRRR.rrr_id.in_([])
+    # Get RRRs — direct baunit_id link
+    rrr_summaries = []
+    if su.baunit_id:
+        rrr_result = await db.execute(
+            select(LaRRR, LaParty)
+            .outerjoin(LaParty, LaRRR.party_id == LaParty.party_id)
+            .where(LaRRR.baunit_id == su.baunit_id)
         )
-    )
-    rrrs_direct = rrrs_result.scalars().all()
+        for rrr, party in rrr_result.all():
+            rrr_summaries.append(RRRSummary(
+                rrr_id=rrr.rrr_id,
+                type=rrr.type,
+                rrr_subclass=rrr.rrr_subclass,
+                description=rrr.description,
+                status=rrr.status,
+                party_name=party.name if party else None,
+                party_role=party.uz_role if party else None,
+            ))
 
-    # Also get via rrr_baunit join if any
-    rrrs_join = []
-    if rrr_ids:
-        rrrs_join_result = await db.execute(
-            select(LaRRR).options(selectinload(LaRRR.party))
-            .where(LaRRR.rrr_id.in_(rrr_ids))
+        # Also get RRRs via la_rrr_baunit junction table
+        rrr_join_result = await db.execute(
+            select(LaRRR, LaParty)
+            .outerjoin(LaParty, LaRRR.party_id == LaParty.party_id)
+            .join(LaRRRBaunit, LaRRR.rrr_id == LaRRRBaunit.rrr_id)
+            .where(LaRRRBaunit.baunit_id == su.baunit_id)
         )
-        rrrs_join = rrrs_join_result.scalars().all()
+        existing_ids = {r.rrr_id for r in [x[0] for x in rrr_result.all()] if r} if False else \
+                       {s.rrr_id for s in [summary for summary in rrr_summaries] if hasattr(s, 'rrr_id')}
 
-    # Deduplicate
-    seen = set()
-    all_rrrs = []
-    for rrr in list(rrrs_direct) + list(rrrs_join):
-        if rrr.rrr_id not in seen:
-            seen.add(rrr.rrr_id)
-            all_rrrs.append(rrr)
-
-    rrr_summaries = [
-        RRRSummary(
-            rrr_id=r.rrr_id,
-            type=r.type,
-            rrr_subclass=r.rrr_subclass,
-            description=r.description,
-            status=r.status,
-            party_name=r.party.name if r.party else None,
-            party_role=r.party.uz_role if r.party else None,
-        )
-        for r in all_rrrs
-    ]
+        for rrr, party in rrr_join_result.all():
+            if rrr.rrr_id not in {s.rrr_id for s in rrr_summaries}:
+                rrr_summaries.append(RRRSummary(
+                    rrr_id=rrr.rrr_id,
+                    type=rrr.type,
+                    rrr_subclass=rrr.rrr_subclass,
+                    description=rrr.description,
+                    status=rrr.status,
+                    party_name=party.name if party else None,
+                    party_role=party.uz_role if party else None,
+                ))
 
     # IFC mappings
-    from app.schemas.ladm import IFCMappingOut
-    ifc_maps = [
-        IFCMappingOut.model_validate(m) for m in su.ifc_mappings
-    ]
+    ifc_maps = [IFCMappingOut.model_validate(m) for m in su.ifc_mappings]
 
     # Geometry → WGS84
     geom_wgs84 = await _geom_to_wgs84(db, su_id)
@@ -328,6 +327,7 @@ async def spatial_unit_full_record(
         area_m2=float(su.area_m2) if su.area_m2 else None,
         capacity=su.capacity,
         surface_relation=su.surface_relation,
+        dimension=su.dimension,
         global_id_ifc=su.global_id_ifc,
         baunit_name=su.baunit.name if su.baunit else None,
         baunit_type=su.baunit.unit_type if su.baunit else None,
@@ -335,7 +335,6 @@ async def spatial_unit_full_record(
         ifc_mappings=ifc_maps,
         geometry_wgs84=geom_wgs84,
     )
-
 
 # ── IFC Mapping ───────────────────────────────────────────────
 
